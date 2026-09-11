@@ -145,16 +145,26 @@ def normalise(df: pd.DataFrame,
         print("[features] WARNING: No feature columns found for normalisation")
         return df, scaler
 
-    # Fit or transform
+    # Fit or transform (P0 FIX: use pre-fitted scaler if provided)
     df_normalised = df.copy()
-    df_normalised[feature_cols] = scaler.fit_transform(df[feature_cols])
+    if scaler is not None and hasattr(scaler, 'center_'):
+        # Scaler already fitted — transform only (no leakage)
+        df_normalised[feature_cols] = scaler.transform(df[feature_cols])
+        print(f"[features] Using pre-fitted scaler for transform only")
+    else:
+        # Fit new scaler
+        df_normalised[feature_cols] = scaler.fit_transform(df[feature_cols])
+        print(f"[features] Fitted new scaler")
 
-    # Save scaler
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
-    scaler_path = os.path.join(PROCESSED_DIR, "scaler.pkl")
-    with open(scaler_path, "wb") as f:
-        pickle.dump(scaler, f)
-    print(f"[features] Scaler saved to {scaler_path}")
+    # Save scaler only if it's a new fit (not a pre-fitted one)
+    if not hasattr(scaler, 'center_') or scaler.center_ is None:
+        os.makedirs(PROCESSED_DIR, exist_ok=True)
+        scaler_path = os.path.join(PROCESSED_DIR, "scaler.pkl")
+        with open(scaler_path, "wb") as f:
+            pickle.dump(scaler, f)
+        print(f"[features] Scaler saved to {scaler_path}")
+    else:
+        print(f"[features] Pre-fitted scaler — skipping save (already persisted)")
 
     return df_normalised, scaler
 

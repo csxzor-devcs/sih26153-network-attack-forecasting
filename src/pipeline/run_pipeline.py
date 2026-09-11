@@ -25,7 +25,7 @@ from src.pipeline.loader import load_cicids2017, load_unswnb15, merge_datasets
 from src.pipeline.labeller import apply_stage_labels, apply_mitre_labels, \
     get_stage_distribution, print_label_mapping_table
 from src.pipeline.features import select_features, handle_infinities, \
-    handle_nulls, normalise
+    handle_nulls, normalise, RobustScaler
 from src.pipeline.sequencer import reconstruct_campaigns, create_sliding_windows, \
     create_campaign_splits, save_sequences, print_campaign_stats
 
@@ -38,6 +38,15 @@ def run_pipeline(data_dir="data/raw/cicids2017",
                  unswnb15_dir="data/raw/unswnb15"):
     """
     Execute the complete data pipeline from raw CSVs to saved sequences.
+
+    P0 FIX: Scaler is fitted on training data only (no preprocessing leakage).
+    Full pipeline flow:
+    1. Load & label raw data
+    2. Select features & handle infinities/nulls (unsupervised, safe)
+    3. Create campaigns & splits FIRST
+    4. Fit scaler on train campaign flows ONLY
+    5. Transform train/val/test with the same scaler
+    6. Create sliding windows & save sequences
 
     Args:
         data_dir: Path to CIC-IDS2017 CSV files.
@@ -63,12 +72,11 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     stage_dist = get_stage_distribution(df)
     print(f"\nStage distribution:\n{json.dumps(stage_dist, indent=2)}")
 
-    # Step 3: Feature selection + normalisation
-    print("\n[Phase 3/5] Selecting and normalising features...")
+    # Step 3: Feature selection (unsupervised — safe before split)
+    print("\n[Phase 3/5] Selecting features...")
     df_features = select_features(df, FEATURE_COLS)
 
     # Drop unnecessary columns to free memory before heavy ops
-    # Keep: features, Timestamp, stage, Label (needed for campaigns)
     keep_cols = set(FEATURE_COLS + ["Timestamp", "stage", "Label"])
     drop_cols = [c for c in df_features.columns if c not in keep_cols]
     if drop_cols:
@@ -76,20 +84,66 @@ def run_pipeline(data_dir="data/raw/cicids2017",
 
     df_features = handle_infinities(df_features)
     df_features = handle_nulls(df_features)
-    df_normalised, scaler = normalise(df_features)
 
-    # Step 4: Reconstruct campaigns (vectorised, with subsample)
+    # Step 4: Reconstruct campaigns BEFORE fitting scaler
+    # P0 FIX: Campaigns are created from raw (non-scaled) features
+    # so the scaler can be fitted on train data only
     print("\n[Phase 4/5] Reconstructing attack campaigns...")
-    campaigns = reconstruct_campaigns(df_normalised, subsample=max_rows, n_campaigns=n_campaigns)
+    campaigns = reconstruct_campaigns(df_features, subsample=max_rows,
+                                       n_campaigns=n_campaigns)
     campaign_stats = print_campaign_stats(campaigns)
 
-    # Step 5: Create campaign splits
+    # Step 5: Create campaign splits (before any scaling)
     print("\n[Phase 5a/5] Splitting campaigns into train/val/test...")
-    campaign_splits = create_campaign_splits(campaigns, train_ratio=0.7, val_ratio=0.15)
+    campaign_splits = create_campaign_splits(campaigns, train_ratio=0.7,
+                                              val_ratio=0.15)
 
-    # Step 6: Create sliding windows (temporally-safe)
-    print("\n[Phase 5b/5] Creating sliding-window sequences...")
-    windows = create_sliding_windows(campaigns, window_size=20, forecast_horizon=1)
+    # Step 6: Fit scaler on TRAINING campaign data ONLY
+    # P0 FIX: No preprocessing leakage — scaler sees only train data
+    print("\n[Phase 5b/5] Fitting scaler on training data only...")
+    train_campaign_ids = campaign_splits["train"]
+    train_flows = []
+    for cid in train_campaign_ids:
+        if cid in campaigns:
+            train_flows.extend(campaigns[cid])
+
+    # Build feature matrix from train flows
+    train_feature_matrix = np.array(
+        [[flow.get(col, 0.0) for col in FEATURE_COLS]
+         for flow in train_flows],
+        dtype=np.float32
+    )
+    print(f"[pipeline] Fitting RobustScaler on {len(train_flows)} train flows...")
+    scaler = RobustScaler()
+    scaler.fit(train_feature_matrix)
+    print(f"[pipeline] Scaler fitted. Location shape: {scaler.location_.shape}")
+
+    # Step 7: Normalise ALL campaigns using train-fitted scaler
+    print("\n[Phase 5c/5] Normalising campaigns with train-fitted scaler...")
+    for cid, flows in campaigns.items():
+        for flow in flows:
+            feature_vals = np.array(
+                [flow.get(col, 0.0) for col in FEATURE_COLS],
+                dtype=np.float32
+            )
+            # Only scale if scaler is fitted
+            if hasattr(scaler, 'transform'):
+                scaled = scaler.transform(feature_vals.reshape(1, -1))[0]
+                for j, col in enumerate(FEATURE_COLS):
+                    flow[col] = float(scaled[j])
+
+    # Save the fitted scaler for inference-time use
+    import pickle
+    scaler_path = os.path.join("data", "processed", "scaler.pkl")
+    os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler, f)
+    print(f"[pipeline] Scaler saved to {scaler_path}")
+
+    # Step 8: Create sliding windows (temporally-safe)
+    print("\n[Phase 6/5] Creating sliding-window sequences...")
+    windows = create_sliding_windows(campaigns, window_size=20,
+                                      forecast_horizon=1)
     metadata = save_sequences(windows, output_dir,
                                campaign_splits=campaign_splits,
                                campaigns=campaigns)
@@ -106,6 +160,7 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     print(f"Campaign splits: train={len(campaign_splits['train'])}, "
           f"val={len(campaign_splits['val'])}, "
           f"test={len(campaign_splits['test'])}")
+    print(f"Scaler fitted on TRAIN ONLY (no leakage)")
     print(f"Sequences saved to: {output_dir}")
     print("=" * 80)
 
@@ -114,7 +169,7 @@ def run_pipeline(data_dir="data/raw/cicids2017",
         "num_campaigns": campaign_stats["total_campaigns"],
         "avg_campaign_length": campaign_stats["avg_campaign_length"],
         "stage_distribution": stage_dist,
-        "scaler_path": "data/processed/scaler.pkl",
+        "scaler_path": scaler_path,
     }
 
 

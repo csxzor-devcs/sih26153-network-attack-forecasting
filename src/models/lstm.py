@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import classification_report, accuracy_score, f1_score
 
 try:
     from src.config import STAGE_ORDER, STAGE_TO_IDX, FEATURE_COLS, MODEL_DIR
@@ -232,7 +232,10 @@ def train_lstm(X_train: np.ndarray, y_train: np.ndarray,
             all_labels.extend(batch_y.cpu().numpy())
 
     final_acc = accuracy_score(all_labels, all_preds)
-    print(f"[lstm] Final Val Accuracy: {final_acc:.4f}")
+    macro_f1 = f1_score(all_labels, all_preds, average="macro",
+                            zero_division=0)
+    print(f"[lstm] Final Val Accuracy: {final_acc:.4f}, "
+          f"Macro F1: {macro_f1:.4f}")
 
     # Save metadata
     metadata = {
@@ -244,6 +247,7 @@ def train_lstm(X_train: np.ndarray, y_train: np.ndarray,
         "stage_to_idx": STAGE_TO_IDX,
         "idx_to_stage": {v: k for k, v in STAGE_TO_IDX.items()},
         "val_accuracy": round(final_acc, 4),
+        "val_macro_f1": round(macro_f1, 4),
         "best_val_accuracy": round(best_val_acc, 4),
         "epochs": epochs,
         "history": history,
@@ -358,4 +362,7 @@ if __name__ == "__main__":
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(batch_y.cpu().numpy())
     test_acc = accuracy_score(all_labels, all_preds)
-    print(f"[lstm] Test accuracy (campaign-held-out): {test_acc:.4f}")
+    test_macro_f1 = f1_score(all_labels, all_preds, average="macro",
+                                  zero_division=0)
+    print(f"[lstm] Test accuracy (campaign-held-out): {test_acc:.4f}, "
+          f"Macro F1: {test_macro_f1:.4f}")

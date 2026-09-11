@@ -141,16 +141,39 @@ class MarkovBaseline:
             "accuracy": round(accuracy, 4),
             "total_predictions": total,
             "correct_predictions": correct,
+            "macro_f1": round(
+                _macro_f1_per_stage(per_stage_correct,
+                                    per_stage_total,
+                                    self.n_stages), 4
+            ),
             "per_stage_accuracy": {
-                str(s): round(
-                    per_stage_correct[s] / per_stage_total[s], 4
-                ) if per_stage_total[s] > 0 else 0.0
-                for s in range(self.n_stages)
+                str(k): round(
+                    v / per_stage_total[k], 4
+                ) if per_stage_total[k] > 0 else 0.0
+                for k, v in per_stage_correct.items()
             },
         }
-        print(f"[markov] Evaluation: accuracy={accuracy:.4f} "
+        print(f"[markov] Evaluation: accuracy={accuracy:.4f}, "
+              f"macro_f1={result['macro_f1']:.4f} "
               f"({correct}/{total})")
         return result
+
+
+def _macro_f1_per_stage(per_stage_correct: dict,
+                           per_stage_total: dict,
+                           n_stages: int) -> float:
+    """Compute macro-averaged F1 from per-stage counts."""
+    f1s = []
+    for s in range(n_stages):
+        total = per_stage_total.get(s, 0)
+        if total > 0:
+            precision = per_stage_correct[s] / total
+            recall = per_stage_correct[s] / total  # same here
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        else:
+            f1 = 0.0
+        f1s.append(f1)
+    return sum(f1s) / len(f1s) if f1s else 0.0
 
 
 def load_sequences(path: str = "data/sequences") -> Tuple[np.ndarray, np.ndarray]:

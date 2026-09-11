@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import classification_report, accuracy_score, f1_score
 
 try:
     from src.config import STAGE_ORDER, STAGE_TO_IDX, MODEL_DIR
@@ -153,8 +153,8 @@ class AttackTransformer(nn.Module):
             x = layer(x)
 
         x = self.norm(x)
-        # Use first token (CLS-style) for classification
-        out = self.fc(x[:, 0, :])  # (B, n_stages)
+        # Use last token for classification (P0 FIX: was x[:, 0, :])
+        out = self.fc(x[:, -1, :])  # (B, n_stages)
         return out
 
 
@@ -312,7 +312,10 @@ def train_transformer(X_train: np.ndarray, y_train: np.ndarray,
             all_labels.extend(batch_y.cpu().numpy())
 
     final_acc = accuracy_score(all_labels, all_preds)
-    print(f"[transformer] Final Val Accuracy: {final_acc:.4f}")
+    macro_f1 = f1_score(all_labels, all_preds, average="macro",
+                              zero_division=0)
+    print(f"[transformer] Final Val Accuracy: {final_acc:.4f}, "
+          f"Macro F1: {macro_f1:.4f}")
 
     # Save metadata
     metadata = {
@@ -326,6 +329,7 @@ def train_transformer(X_train: np.ndarray, y_train: np.ndarray,
         "stage_to_idx": STAGE_TO_IDX,
         "idx_to_stage": {v: k for k, v in STAGE_TO_IDX.items()},
         "val_accuracy": round(final_acc, 4),
+        "val_macro_f1": round(macro_f1, 4),
         "best_val_accuracy": round(best_val_acc, 4),
         "epochs": epochs,
         "history": history,
@@ -418,7 +422,8 @@ if __name__ == "__main__":
                                    batch_size=512,
                                    class_weights=weight_tensor)
     print(f"\nTransformer training complete. Val accuracy: "
-          f"{metadata['val_accuracy']:.4f}")
+          f"{metadata['val_accuracy']:.4f}, "
+          f"Macro F1: {metadata['val_macro_f1']:.4f}")
 
     # Evaluate on test set (campaign-held-out)
     print(f"\n[transformer] Evaluating on test set...")
@@ -436,4 +441,7 @@ if __name__ == "__main__":
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(batch_y.cpu().numpy())
     test_acc = accuracy_score(all_labels, all_preds)
-    print(f"[transformer] Test accuracy (campaign-held-out): {test_acc:.4f}")
+    test_macro_f1 = f1_score(all_labels, all_preds, average="macro",
+                                   zero_division=0)
+    print(f"[transformer] Test accuracy (campaign-held-out): {test_acc:.4f}, "
+          f"Macro F1: {test_macro_f1:.4f}")

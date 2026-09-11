@@ -115,6 +115,7 @@ class XGBoostBaseline:
 
     def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         """Compute accuracy and per-class accuracy."""
+        from sklearn.metrics import f1_score, precision_score, recall_score
         y_true = y_true.flatten().astype(int)
         y_pred = y_pred.flatten().astype(int)
         correct = (y_true == y_pred).sum()
@@ -130,10 +131,17 @@ class XGBoostBaseline:
                     (y_pred[mask] == stage_idx).mean(), 4
                 )
 
+        macro_f1 = f1_score(y_true, y_pred, average="macro",
+                              zero_division=0)
+        weighted_f1 = f1_score(y_true, y_pred, average="weighted",
+                                  zero_division=0)
+
         return {
             "accuracy": round(accuracy, 4),
             "total": total,
             "per_class_accuracy": per_class,
+            "macro_f1": round(macro_f1, 4),
+            "f1_weighted": round(weighted_f1, 4),
         }
 
 
@@ -282,16 +290,18 @@ def print_comparison_results(results: Dict[str, dict]):
 
     print("=" * 80)
 
-    # Determine winner
+    # Determine winner by Macro F1 (not accuracy)
     valid_results = {k: v for k, v in results.items()
-                     if "accuracy" in v}
+                     if "f1_weighted" in v and "accuracy" in v}
     if valid_results:
-        winner = max(valid_results, key=lambda k: valid_results[k]["accuracy"])
+        winner = max(valid_results, key=lambda k: valid_results[k].get("f1_weighted", 0))
         print(f"\n🏆 Best baseline: {winner} "
-              f"({valid_results[winner]['accuracy']:.4f})")
+              f"(Macro F1: {valid_results[winner].get('f1_weighted', 0):.4f}, "
+              f"Accuracy: {valid_results[winner]['accuracy']:.4f}) "
+              f"[ranked by macro_f1]")
         print(f"\n📊 Baseline hierarchy:")
-        print(f"   Majority → Markov → XGBoost → LSTM")
-        print(f"   Each layer should add value.")
+        print(f"   Majority → Markov → XGBoost → LSTM → Transformer")
+        print(f"   Ranked by Macro F1 (not accuracy) for imbalanced classes.")
         print(f"   If XGBoost ≈ LSTM, consider feature engineering or attention.")
         print(f"   If Markov ≈ Majority, the Markov chain has no signal.")
 
@@ -304,10 +314,15 @@ def save_comparison_report(results: Dict[str, dict],
     os.makedirs(output_dir, exist_ok=True)
     report_path = os.path.join(output_dir, "baseline_comparison.json")
 
+    valid = {k: v for k, v in results.items()
+             if "macro_f1" in v}
+    winner = max(valid, key=lambda k: valid[k]["macro_f1"]) if valid else None
     report = {
         "timestamp": __import__("datetime").datetime.now().isoformat(),
         "results": results,
-        "winner": max(results, key=lambda k: results[k].get("accuracy", 0)) if results else None,
+        "winner": winner,
+        "ranking_metric": "macro_f1",
+        "winner_macro_f1": valid[winner]["macro_f1"] if winner else None,
     }
 
     with open(report_path, "w") as f:
