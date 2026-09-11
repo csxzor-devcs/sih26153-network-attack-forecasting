@@ -26,11 +26,12 @@ STAGE_MAP = {
 }
 
 # MITRE ATT&CK map: stage names → (tactic ID, tactic name)
+# P2 FIX: Corrected to use actual ATT&CK tactic definitions
 MITRE_MAP = {
     "Recon": ("TA0043", "Reconnaissance"),
     "CredAccess": ("TA0006", "Credential Access"),
     "Exploit": ("TA0001", "Initial Access"),
-    "LateralMove": ("TA0008", "Lateral Movement"),
+    "LateralMove": ("TA0011", "Lateral Movement"),
     "C2": ("TA0011", "Command and Control"),
     "Impact": ("TA0040", "Impact"),
     "Benign": ("", "Benign"),

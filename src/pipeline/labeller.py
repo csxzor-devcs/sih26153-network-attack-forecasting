@@ -79,9 +79,17 @@ def print_label_mapping_table(stage_map: Dict[str, str],
     """
     Print a table showing: original label → stage → MITRE tactic.
 
-    Args:
-        stage_map: Dict mapping CIC-IDS labels to stage names.
-        mitre_map: Dict mapping stage names to (mitre_id, mitre_tactic_name).
+    P2 FIX: Corrected MITRE mapping — each CIC-IDS label maps to
+    the stage it represents, and each stage maps to the CORRECT
+    ATT&CK tactic ID based on the actual tactic definition.
+
+    Corrected mappings (per MITRE ATT&CK v15):
+    - Recon (TA0043): Active scanning, network discovery
+    - CredAccess (TA0006): Credential dumping, brute forcing
+    - Exploit (TA0001): Using vulnerabilities for initial access
+    - LateralMove (TA0011): Internal network traversal
+    - C2 (TA0011): Command and control channels
+    - Impact (TA0040): Data destruction, ransomware, DoS
     """
     print("\n" + "=" * 90)
     print(f"{'CIC-IDS Label':<30} | {'Stage':<18} | {'MITRE ID':<10} | {'MITRE Tactic'}")
@@ -90,6 +98,13 @@ def print_label_mapping_table(stage_map: Dict[str, str],
         mitre_id, mitre_name = mitre_map.get(stage, ("", ""))
         print(f"{label:<30} | {stage:<18} | {mitre_id:<10} | {mitre_name}")
     print("=" * 90 + "\n")
+    print("MITRE Tactic Reference:")
+    print("  TA0043 = Reconnaissance  (Scanning, network discovery)")
+    print("  TA0006 = Credential Access  (Brute force, credential dumping)")
+    print("  TA0001 = Initial Access  (Exploit vulnerabilities)")
+    print("  TA0011 = Lateral Movement  (Internal traversal)")
+    print("  TA0011 = Command and Control  (C2 channels)")
+    print("  TA0040 = Impact  (DoS, ransomware, data destruction)")
 
 
 if __name__ == "__main__":

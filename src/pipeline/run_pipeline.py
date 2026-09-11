@@ -125,12 +125,10 @@ def run_pipeline(data_dir="data/raw/cicids2017",
             feature_vals = np.array(
                 [flow.get(col, 0.0) for col in FEATURE_COLS],
                 dtype=np.float32
-            )
-            # Only scale if scaler is fitted
-            if hasattr(scaler, 'transform'):
-                scaled = scaler.transform(feature_vals.reshape(1, -1))[0]
-                for j, col in enumerate(FEATURE_COLS):
-                    flow[col] = float(scaled[j])
+            ).reshape(1, -1)
+            scaled = scaler.transform(feature_vals)[0]
+            for j, col in enumerate(FEATURE_COLS):
+                flow[col] = float(scaled[j])
 
     # Save the fitted scaler for inference-time use
     import pickle

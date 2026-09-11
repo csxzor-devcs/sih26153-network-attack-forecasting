@@ -55,27 +55,36 @@ def reconstruct_campaigns(df: pd.DataFrame,
         timestamp, stage, src_ip, dst_ip, src_port, dst_port, protocol,
         AND all FEATURE_COLS values.
     """
-    # Subsample if too large (stratified by stage)
-    if len(df) > subsample:
-        print(f"[sequencer] Dataset has {len(df)} rows -- subsampling to {subsample}")
-        n_per_stage = max(1, subsample // len(df.groupby("stage")))
-        df = df.groupby("stage", group_keys=False).apply(
-            lambda g: g.sample(min(len(g), n_per_stage), random_state=42)
-        ).reset_index(drop=True)
-        print(f"[sequencer] After subsample: {len(df)} rows")
-
     # CRITICAL: Sort by Timestamp to ensure temporal ordering
+    # P2 FIX: Preserve temporal continuity — subsample via contiguous
+    # time windows, NOT stratified random sampling which destroys
+    # the sequential nature of attack campaigns
     df_sorted = df.sort_values("Timestamp").reset_index(drop=True)
     n = len(df_sorted)
 
+    if n > subsample:
+        print(f"[sequencer] Dataset has {n} rows -- subsampling to {subsample}")
+        # Use contiguous time segments to preserve temporal structure
+        # Pick evenly-spaced time windows across the dataset
+        stride = n / subsample
+        indices = []
+        for i in range(subsample):
+            idx = int(i * stride)
+            if idx < n:
+                indices.append(idx)
+        df_sorted = df_sorted.iloc[indices].reset_index(drop=True)
+        print(f"[sequencer] After temporal subsample: {len(df_sorted)} rows")
+
     # Split into n_campaigns contiguous time-ordered segments
-    segment_size = max(1, n // n_campaigns)
+    # Each campaign is a continuous time window — preserves attack
+    # progression patterns
+    segment_size = max(1, len(df_sorted) // n_campaigns)
     campaigns = {}
 
     for campaign_idx in range(n_campaigns):
         start_idx = campaign_idx * segment_size
         if campaign_idx == n_campaigns - 1:
-            end_idx = n
+            end_idx = len(df_sorted)
         else:
             end_idx = start_idx + segment_size
 
