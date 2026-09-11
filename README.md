@@ -31,15 +31,17 @@ This maps directly to the **MITRE ATT&CK framework** — the industry standard f
 
 ## How It Works
 
-The system has **three prediction engines** that you can choose from:
+The system has **five prediction engines** compared in a proper baseline hierarchy:
 
-| Model | What It Does | Accuracy | Size |
-|-------|-------------|----------|------|
-| **Markov** | Uses probability rules learned from attack sequences | ~80% | 4 KB |
-| **LSTM** | Neural network that remembers patterns over time | ~80% | 223 KB |
-| **Transformer** | Advanced neural network with attention mechanism | ~80% | 543 KB |
+| Model | What It Does | Params | Role |
+|-------|-------------|--------|------|
+| **Majority** | Always predicts the most frequent class | 0 | Floor baseline |
+| **Markov** | First-order chain on stage transitions | ~5 KB | Probabilistic baseline |
+| **XGBoost** | Gradient-boosted trees on window features | ~1 MB | Strong non-neural baseline |
+| **LSTM** | Neural network that remembers temporal patterns | ~223 KB | Deep learning baseline |
+| **Transformer** | Self-attention over flow sequences | ~543 KB | Advanced deep learning baseline |
 
-All models were trained on the **CIC-IDS2017 dataset** — a real-world collection of network attacks and benign traffic (~100K flows used, from 2.8M total).
+All models are evaluated on the **same campaign-held-out test set** to ensure fair comparison. Campaign-based train/val/test splits prevent temporal data leakage.
 
 ---
 

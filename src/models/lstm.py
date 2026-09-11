@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from typing import Optional
 from sklearn.metrics import classification_report, accuracy_score
 
 try:
@@ -88,7 +89,8 @@ def train_lstm(X_train: np.ndarray, y_train: np.ndarray,
                epochs: int = 20,
                batch_size: int = 512,
                learning_rate: float = 0.001,
-               model_dir: str = MODEL_DIR) -> dict:
+               model_dir: str = MODEL_DIR,
+               class_weights: Optional[torch.Tensor] = None) -> dict:
     """
     Train an LSTM model on attack sequences.
 
@@ -127,8 +129,22 @@ def train_lstm(X_train: np.ndarray, y_train: np.ndarray,
                        n_layers=n_layers, n_stages=len(STAGE_ORDER))
     model.to(device)
 
-    # Standard CrossEntropyLoss (class imbalance handled by the data skew itself)
-    criterion = nn.CrossEntropyLoss()
+    # Compute class weights to handle imbalance
+    # Weight inversely proportional to class frequency
+    if class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        # Auto-compute from training labels
+        class_counts = np.bincount(y_train.flatten().astype(int))
+        total = class_counts.sum()
+        n_classes = len(class_counts)
+        # Inverse frequency weighting with smoothing
+        weight = total / (n_classes * class_counts)
+        # Normalize so max weight is 5x to avoid extreme gradients
+        weight = np.minimum(weight, weight.max() * 5.0)
+        weight_tensor = torch.FloatTensor(weight / weight.mean()).to(device)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=3, factor=0.5
@@ -263,26 +279,83 @@ if __name__ == "__main__":
     X = np.load("data/sequences/X.npy").astype(np.float32)
     y = np.load("data/sequences/y.npy").astype(np.int64)
 
-    print(f"Loaded {X.shape[0]} sequences, shape: {X.shape}")
+    # Load campaign-level splits if available
+    splits_path = "data/sequences/metadata.json"
+    import json
+    if os.path.exists(splits_path):
+        with open(splits_path) as f:
+            meta = json.load(f)
+        splits = meta.get("campaign_splits", {})
+        print(f"[lstm] Campaign splits found: {splits}")
 
-    # Subsample to 30K for fast training
-    n = len(y)
-    sample_size = min(30000, n)
-    indices = np.random.RandomState(42).choice(n, sample_size, replace=False)
-    X = X[indices]
-    y = y[indices]
+        # Try loading campaign-specific split files
+        try:
+            X_train = np.load("data/sequences/X_train.npy").astype(np.float32)
+            y_train = np.load("data/sequences/y_train.npy").astype(np.int64)
+            X_val = np.load("data/sequences/X_val.npy").astype(np.float32)
+            y_val = np.load("data/sequences/y_val.npy").astype(np.int64)
+            X_test = np.load("data/sequences/X_test.npy").astype(np.float32) if os.path.exists("data/sequences/X_test.npy") else X_val
+            y_test = np.load("data/sequences/y_test.npy").astype(np.int64) if os.path.exists("data/sequences/y_test.npy") else y_val
+            print(f"[lstm] Loaded campaign splits: "
+                  f"train={X_train.shape[0]}, "
+                  f"val={X_val.shape[0]}, "
+                  f"test={X_test.shape[0]}")
+        except FileNotFoundError:
+            # Fallback to random split if split files missing
+            print("[lstm] Split files not found, using random split")
+            n = len(y)
+            indices = np.random.RandomState(42).choice(n, int(n*0.7), replace=False)
+            mask = np.zeros(n, dtype=bool)
+            mask[indices] = True
+            X_train, X_val = X[mask], X[~mask]
+            y_train, y_val = y[mask], y[~mask]
+            X_test, y_test = X_val, y_val
+    else:
+        # Fallback to random split
+        print("[lstm] No metadata.json found, using random split")
+        n = len(y)
+        indices = np.random.RandomState(42).choice(n, int(n*0.7), replace=False)
+        mask = np.zeros(n, dtype=bool)
+        mask[indices] = True
+        X_train, X_val = X[mask], X[~mask]
+        y_train, y_val = y[mask], y[~mask]
+        X_test, y_test = X_val, y_val
 
-    # Split 80/20 train/val
-    split = int(len(y) * 0.8)
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
+    print(f"[lstm] Train: {X_train.shape[0]}, "
+          f"Val: {X_val.shape[0]}, "
+          f"Test: {X_test.shape[0]}")
 
-    print(f"Train: {X_train.shape[0]}, Val: {X_val.shape[0]}")
+    # Compute class weights from training data
+    class_counts = np.bincount(y_train.flatten().astype(int))
+    total = class_counts.sum()
+    n_classes = len(class_counts)
+    weight = total / (n_classes * class_counts)
+    weight = np.minimum(weight, weight.max() * 5.0)
+    weight_tensor = torch.FloatTensor(weight / weight.mean())
 
     metadata = train_lstm(X_train, y_train, X_val, y_val,
                           n_features=X.shape[2],
                           hidden_size=128,
                           n_layers=2,
                           epochs=20,
-                          batch_size=512)
+                          batch_size=512,
+                          class_weights=weight_tensor)
     print(f"\nLSTM training complete. Val accuracy: {metadata['val_accuracy']:.4f}")
+
+    # Evaluate on test set (campaign-held-out)
+    print(f"\n[lstm] Evaluating on test set...")
+    model = AttackLSTM(n_features=X.shape[2], hidden_size=128,
+                        n_layers=2, n_stages=len(STAGE_ORDER))
+    model.load_state_dict(torch.load("models/lstm_best.pth", weights_only=False))
+    model.eval()
+    test_dataset = AttackSequenceDataset(X_test, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch_X, batch_y in test_loader:
+            outputs = model(batch_X)
+            _, predicted = torch.max(outputs, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch_y.cpu().numpy())
+    test_acc = accuracy_score(all_labels, all_preds)
+    print(f"[lstm] Test accuracy (campaign-held-out): {test_acc:.4f}")

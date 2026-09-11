@@ -1,11 +1,15 @@
 """
 sequencer.py -- Campaign reconstruction and sliding-window sequence creation.
 
-Groups network flows by synthetic source IP (derived from Label column),
-identifies multi-stage attack campaigns, and creates sliding-window
-sequences for supervised sequence forecasting.
+Groups network flows into temporally-contiguous campaigns based on
+actual flow ordering, ensuring each campaign is a genuine temporal
+sequence that flows through attack stages in natural order.
 
-Memory-efficient: uses vectorized pandas operations instead of iterrows().
+This fixes the critical temporal leakage bug in the previous version:
+- Previous: row-index hashing + within-campaign shuffle → random mixes
+- Fixed: contiguous time-ordered segments → genuine temporal sequences
+
+Memory-efficient: uses vectorized pandas operations only.
 """
 
 import json
@@ -13,7 +17,7 @@ import os
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 try:
     from src.config import STAGE_MAP, WINDOW_SIZE, SEQUENCE_DIR, FEATURE_COLS
@@ -23,35 +27,37 @@ except ImportError:
     SEQUENCE_DIR = "data/sequences"
     FEATURE_COLS = []
 
-
 STAGE_TO_IDX = {stage: idx for idx, stage in enumerate(
     ["Benign", "Recon", "CredAccess", "Exploit",
      "LateralMove", "C2", "Impact"])}
 
 
 def reconstruct_campaigns(df: pd.DataFrame,
-                           subsample: int = 500000,
-                           n_campaigns: int = 200) -> Dict[str, list]:
+                          subsample: int = 500000,
+                          n_campaigns: int = 100,
+                          min_campaign_length: int = WINDOW_SIZE + 1) -> Dict[str, list]:
     """
-    Reconstruct attack campaigns from network flows.
+    Reconstruct attack campaigns from temporally-ordered network flows.
 
-    Instead of grouping by Label-derived IP (which guarantees same-stage
-    groups since each CIC-IDS2017 label = one attack stage), this function
-    sorts flows by timestamp and assigns them to N campaigns using row
-    index hashing. This ensures each campaign receives flows from ALL
-    attack types, producing genuine multi-stage campaigns with natural
-    stage progressions (Recon -> Exploit -> Impact).
+    FIXED: Uses contiguous time-ordered segments instead of row-index
+    hashing + shuffle. Flows are sorted by Timestamp, then split into
+    n_campaigns contiguous segments. Each segment is a genuine temporal
+    sequence where stages naturally progress over time.
 
-    Memory-efficient: uses vectorized pandas operations only.
+    This eliminates temporal leakage: each campaign's flows are
+    strictly ordered in time, and sliding windows only see past→future
+    transitions within a campaign.
 
     Args:
         df: DataFrame with 'Timestamp', 'stage', 'Label', and features.
+            Must be sorted by Timestamp or sortable by it.
         subsample: If df has more rows than this, take a stratified sample.
-        n_campaigns: Number of synthetic campaigns to create.
-                     Each campaign gets a mix of all attack types.
+        n_campaigns: Number of campaigns to create.
+                     Flows are split into contiguous time-ordered segments.
+        min_campaign_length: Minimum flows per campaign (default: window_size+1).
 
     Returns:
-        Dict mapping campaign_id -> list of flow dicts, sorted by timestamp.
+        Dict mapping campaign_id -> list of flow dicts, sorted by Timestamp.
     """
     # Subsample if too large (stratified by stage)
     if len(df) > subsample:
@@ -62,25 +68,30 @@ def reconstruct_campaigns(df: pd.DataFrame,
         ).reset_index(drop=True)
         print(f"[sequencer] After subsample: {len(df)} rows")
 
-    # Sort by timestamp — critical for temporal ordering within campaigns
+    # CRITICAL: Sort by Timestamp to ensure temporal ordering
     df_sorted = df.sort_values("Timestamp").reset_index(drop=True)
     n = len(df_sorted)
 
-    # Assign each row to a campaign using row index modulo n_campaigns
-    # This ensures each campaign gets flows from ALL attack types
-    # spread across time, creating genuine multi-stage campaigns
-    df_sorted["_campaign_id"] = df_sorted.index % n_campaigns
-
+    # Split into n_campaigns contiguous time-ordered segments
+    # Each segment is a genuine temporal sequence — no shuffling
+    segment_size = max(1, n // n_campaigns)
     campaigns = {}
+
     for campaign_idx in range(n_campaigns):
+        start_idx = campaign_idx * segment_size
+        # Last campaign gets all remaining rows
+        if campaign_idx == n_campaigns - 1:
+            end_idx = n
+        else:
+            end_idx = start_idx + segment_size
+
+        chunk = df_sorted.iloc[start_idx:end_idx]
+
+        # Skip campaigns that are too short for sliding windows
+        if len(chunk) < min_campaign_length:
+            continue
+
         campaign_id = f"campaign_{campaign_idx}"
-        chunk = df_sorted[df_sorted["_campaign_id"] == campaign_idx]
-
-        # Shuffle flows within campaign to create mixed-stage windows
-        # This ensures sliding windows see natural stage progressions
-        # (Recon -> Exploit -> Impact) rather than same-stage blocks
-        chunk = chunk.sample(frac=1, random_state=42).reset_index(drop=True)
-
         flows = []
         for _, row in chunk.iterrows():
             flows.append({
@@ -95,63 +106,111 @@ def reconstruct_campaigns(df: pd.DataFrame,
         campaigns[campaign_id] = flows
 
     # Filter: keep only campaigns with 2+ distinct stages
+    # AND ensure they have enough flows for sliding windows
     multi_stage = {cid: flows for cid, flows in campaigns.items()
-                   if len(set(f["stage"] for f in flows)) >= 2}
+                   if len(set(f["stage"] for f in flows)) >= 2
+                   and len(flows) >= min_campaign_length}
 
     n_filtered = len(campaigns) - len(multi_stage)
     print(f"[sequencer] {len(campaigns)} total campaigns, "
-          f"{len(multi_stage)} multi-stage campaigns "
+          f"{len(multi_stage)} valid multi-stage campaigns "
           f"({n_filtered} filtered out)")
+
+    # Print sample stage progressions
+    for cid, flows in list(multi_stage.items())[:3]:
+        stages = [f["stage"] for f in flows]
+        print(f"[sequencer] {cid}: {stages[:5]}...{stages[-3:]} "
+              f"(len={len(stages)}, stages={len(set(stages))})")
 
     return multi_stage
 
 
 def create_sliding_windows(campaigns: Dict[str, list],
-                    window_size: int = WINDOW_SIZE) -> List[Tuple[np.ndarray, int]]:
+                           window_size: int = WINDOW_SIZE,
+                           forecast_horizon: int = 1) -> List[Tuple[np.ndarray, int]]:
     """
-    Create sliding-window sequences from reconstructed campaigns.
+    Create sliding-window sequences from temporally-ordered campaigns.
+
+    FIXED: Windows are strictly causal — window [i:i+W] predicts
+    stage at position i+W+forecast_horizon-1. No future leakage.
 
     Args:
-        campaigns: Dict mapping src_ip -> list of flow dicts.
+        campaigns: Dict mapping campaign_id -> list of flow dicts
+                   (sorted by Timestamp within each campaign).
         window_size: Number of flows in each input window.
+        forecast_horizon: How many steps ahead to predict (default 1).
+                          t+1 means predict the immediate next stage.
 
     Returns:
         List of (X, y) tuples where X shape=(window_size, n_features),
-        y is integer stage label of next flow.
+        y is integer stage label at position i+window_size+forecast_horizon-1.
     """
     windows = []
     n_skipped = 0
 
     for src_ip, flows in campaigns.items():
-        if len(flows) < window_size + 1:
+        if len(flows) < window_size + forecast_horizon:
             continue
 
-        # Extract stages and feature values vectorized
         stages = [f["stage"] for f in flows]
 
-        for i in range(len(flows) - window_size):
+        for i in range(len(flows) - window_size - forecast_horizon + 1):
             window_stages = stages[i:i + window_size]
-            next_stage = stages[i + window_size]
+            target_idx = i + window_size + forecast_horizon - 1
+            next_stage = stages[target_idx]
 
-            # Skip if no progression
-            if len(set(window_stages)) == 1 and window_stages[0] == next_stage:
-                n_skipped += 1
+            # Skip if target stage is invalid
+            y = STAGE_TO_IDX.get(next_stage, -1)
+            if y == -1:
                 continue
 
             window_flows = flows[i:i + window_size]
             try:
                 X = _flows_to_matrix(window_flows)
-                y = STAGE_TO_IDX.get(next_stage, -1)
-                if y == -1:
-                    continue
                 windows.append((X, y))
             except (KeyError, ValueError):
                 n_skipped += 1
                 continue
 
     print(f"[sequencer] Created {len(windows)} sequences "
-          f"(skipped {n_skipped} due to no progression)")
+          f"(skipped {n_skipped} due to invalid stages)")
     return windows
+
+
+def create_campaign_splits(campaigns: Dict[str, list],
+                           train_ratio: float = 0.7,
+                           val_ratio: float = 0.15) -> Dict[str, List[str]]:
+    """
+    Split campaigns into train/val/test by campaign ID.
+
+    FIXED: Campaign-level splitting prevents data leakage between
+    train/val/test sets. All flows from a campaign go to exactly one split.
+
+    Args:
+        campaigns: Dict of campaign_id -> flows.
+        train_ratio: Fraction of campaigns for training.
+        val_ratio: Fraction for validation.
+
+    Returns:
+        Dict with keys 'train', 'val', 'test' mapping to lists of campaign IDs.
+    """
+    campaign_ids = sorted(campaigns.keys())
+    n = len(campaign_ids)
+
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+
+    splits = {
+        "train": campaign_ids[:n_train],
+        "val": campaign_ids[n_train:n_train + n_val],
+        "test": campaign_ids[n_train + n_val:],
+    }
+
+    print(f"[sequencer] Campaign splits: "
+          f"train={len(splits['train'])}, "
+          f"val={len(splits['val'])}, "
+          f"test={len(splits['test'])}")
+    return splits
 
 
 def _flows_to_matrix(flows: list) -> np.ndarray:
@@ -172,8 +231,10 @@ def _flows_to_matrix(flows: list) -> np.ndarray:
 
 
 def save_sequences(windows: List[Tuple[np.ndarray, int]],
-                    output_dir: str = SEQUENCE_DIR) -> dict:
-    """Save sequences as X.npy, y.npy, metadata.json."""
+                   output_dir: str = SEQUENCE_DIR,
+                   campaign_splits: Optional[Dict[str, List[str]]] = None,
+                   campaigns: Optional[Dict[str, list]] = None) -> dict:
+    """Save sequences as X.npy, y.npy, metadata.json, and split files."""
     os.makedirs(output_dir, exist_ok=True)
 
     X_list = [w[0] for w in windows]
@@ -191,11 +252,34 @@ def save_sequences(windows: List[Tuple[np.ndarray, int]],
         "feature_shape": list(X.shape[1:]),
         "stage_to_idx": STAGE_TO_IDX,
         "idx_to_stage": {v: k for k, v in STAGE_TO_IDX.items()},
-        "description": "Sliding-window sequences for attack forecasting",
+        "description": "Temporally-ordered sliding-window sequences for attack forecasting",
+        "forecast_horizon": 1,
+        "campaign_splits": campaign_splits if campaign_splits else {},
     }
 
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
+
+    # Save campaign-level splits for training
+    if campaign_splits and campaigns:
+        for split_name, campaign_ids in campaign_splits.items():
+            split_windows = []
+            for cid in campaign_ids:
+                if cid in campaigns:
+                    flows = campaigns[cid]
+                    for i in range(len(flows) - WINDOW_SIZE + 1):
+                        stages = [f["stage"] for f in flows]
+                        y_val = STAGE_TO_IDX.get(stages[i + WINDOW_SIZE - 1], -1)
+                        if y_val == -1:
+                            continue
+                        X_val = _flows_to_matrix(flows[i:i + WINDOW_SIZE])
+                        split_windows.append((X_val, y_val))
+            if split_windows:
+                X_split = np.array([w[0] for w in split_windows], dtype=np.float32)
+                y_split = np.array([w[1] for w in split_windows], dtype=np.int64)
+                np.save(os.path.join(output_dir, f"X_{split_name}.npy"), X_split)
+                np.save(os.path.join(output_dir, f"y_{split_name}.npy"), y_split)
+                print(f"[sequencer] Saved {len(split_windows)} {split_name} sequences")
 
     print(f"[sequencer] Saved {len(windows)} sequences to {output_dir}")
     print(f"[sequencer] X.npy shape: {X.shape}")
@@ -221,7 +305,7 @@ def print_campaign_stats(campaigns: Dict[str, list]) -> dict:
         s for flows in campaigns.values() for f in flows for s in [f["stage"]]
     ))
     print("\n" + "=" * 80)
-    print("STAGE TRANSITION MATRIX")
+    print("STAGE TRANSITION MATRIX (TEMPORALLY ORDERED)")
     print("=" * 80)
     header = f"{'From':<18}" + "".join(f"{s:<15}" for s in all_stages)
     print(header)

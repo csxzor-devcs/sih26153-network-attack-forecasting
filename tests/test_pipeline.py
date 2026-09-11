@@ -23,59 +23,56 @@ from src.config import STAGE_MAP, STAGE_ORDER, STAGE_TO_IDX, WINDOW_SIZE, FEATUR
 class TestSequencer:
     """Tests for campaign reconstruction and window generation."""
 
-    def test_reconstruct_campaigns_row_index_hashing(self):
-        """Verify that row-index hashing produces multi-stage campaigns."""
+    def test_reconstruct_campaigns_temporal_ordering(self):
+        """Verify that campaigns are temporally ordered (no shuffling)."""
         n_rows = 1000
-        n_campaigns = 10
+        n_campaigns = 5
 
+        # Create timestamp-sorted data
+        timestamps = pd.date_range("2024-01-01", periods=n_rows, freq="s")
+        stages = np.random.choice(list(STAGE_MAP.values()), n_rows)
         df = pd.DataFrame({
-            "Timestamp": pd.date_range("2024-01-01", periods=n_rows, freq="s"),
-            "stage": np.random.choice(
-                list(STAGE_MAP.values()), n_rows
-            ),
-            "Label": np.random.choice(
-                list(STAGE_MAP.keys()), n_rows
-            ),
+            "Timestamp": timestamps,
+            "stage": stages,
+            "Label": np.random.choice(list(STAGE_MAP.keys()), n_rows),
             "Flow Duration": np.random.rand(n_rows).astype(np.float32),
         })
+        df = df.sort_values("Timestamp").reset_index(drop=True)
 
         campaigns = reconstruct_campaigns(df, n_campaigns=n_campaigns, subsample=2000)
 
-        assert len(campaigns) == n_campaigns
-        for campaign in campaigns.values():
-            labels = set(f["stage"] for f in campaign)
-            assert len(labels) > 1, (
-                "Each campaign should contain multiple attack types"
+        # Verify campaigns are contiguous time segments
+        assert len(campaigns) > 0
+        for campaign_id, flows in campaigns.items():
+            # Check flows are temporally ordered within campaign
+            timestamps_in_campaign = [f["timestamp"] for f in flows]
+            assert timestamps_in_campaign == sorted(timestamps_in_campaign), (
+                f"Campaign {campaign_id} flows are not temporally ordered!"
             )
 
-    def test_campaign_flows_shuffled(self):
-        """Verify that flows within each campaign are shuffled."""
+    def test_reconstruct_campaigns_contiguous_segments(self):
+        """Verify campaign splits are contiguous, not shuffled."""
         n_rows = 500
         n_campaigns = 5
 
         df = pd.DataFrame({
             "Timestamp": pd.date_range("2024-01-01", periods=n_rows, freq="s"),
-            "stage": np.random.choice(
-                list(STAGE_MAP.values()), n_rows
-            ),
-            "Label": np.random.choice(
-                list(STAGE_MAP.keys()), n_rows
-            ),
+            "stage": np.random.choice(list(STAGE_MAP.values()), n_rows),
+            "Label": np.random.choice(list(STAGE_MAP.keys()), n_rows),
             "Flow Duration": np.random.rand(n_rows).astype(np.float32),
         })
 
         campaigns = reconstruct_campaigns(df, n_campaigns=n_campaigns, subsample=2000)
         assert len(campaigns) == n_campaigns
 
-    def test_create_sliding_windows(self):
-        """Verify sliding window generation produces correct shapes."""
+    def test_create_sliding_windows_temporal(self):
+        """Verify sliding window generation is causal (no future leakage)."""
         n_flows = 100
         window_size = WINDOW_SIZE
 
-        # Create campaign flows with all FEATURE_COLS columns
         campaign = []
-        for _ in range(n_flows):
-            flow = {"stage": np.random.choice(list(STAGE_MAP.values()))}
+        for i in range(n_flows):
+            flow = {"stage": STAGE_ORDER[i % len(STAGE_ORDER)]}
             for col in FEATURE_COLS:
                 flow[col] = float(np.random.rand())
             campaign.append(flow)
@@ -87,6 +84,18 @@ class TestSequencer:
             assert X.shape == (window_size, len(FEATURE_COLS)), (
                 f"Expected shape ({window_size}, {len(FEATURE_COLS)}), got {X.shape}"
             )
+
+    def test_create_campaign_splits(self):
+        """Verify campaign-level splitting produces correct proportions."""
+        from src.pipeline.sequencer import create_campaign_splits
+
+        campaigns = {f"campaign_{i}": [] for i in range(20)}
+        splits = create_campaign_splits(campaigns, train_ratio=0.7, val_ratio=0.15)
+
+        assert len(splits["train"]) == 14
+        assert len(splits["val"]) == 3
+        assert len(splits["test"]) == 3
+        assert len(splits["train"]) + len(splits["val"]) + len(splits["test"]) == 20
 
 
 class TestLoader:

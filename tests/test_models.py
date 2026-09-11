@@ -15,7 +15,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.baseline.markov import MarkovBaseline
-from src.config import STAGE_ORDER, STAGE_TO_IDX, WINDOW_SIZE
+from src.baseline.comparison import MajorityClassifier, XGBoostBaseline
+from src.config import STAGE_ORDER, STAGE_TO_IDX, WINDOW_SIZE, FEATURE_COLS
 
 
 class TestMarkovBaseline:
@@ -172,3 +173,42 @@ class TestModelTraining:
         assert "val_accuracy" in metadata
         assert "d_ff" in metadata
         assert metadata["d_ff"] == 256
+
+
+class TestBaselineComparison:
+    """Tests for the baseline comparison framework."""
+
+    def test_majority_classifier(self):
+        """Verify majority classifier works correctly."""
+        clf = MajorityClassifier()
+        y = np.array([0] * 80 + [1] * 15 + [2] * 5)
+        clf.fit(y)
+        assert clf.majority_class == 0
+        preds = clf.predict(np.random.randn(10, WINDOW_SIZE, 10))
+        assert all(p == 0 for p in preds)
+
+    def test_xgboost_baseline_fit(self):
+        """Verify XGBoost baseline can be trained."""
+        clf = XGBoostBaseline(n_stages=7, n_estimators=5)
+        X = np.random.randn(30, WINDOW_SIZE * len(FEATURE_COLS))
+        y = np.random.randint(0, 7, size=30)
+        clf.fit(X, y)
+        assert clf.model is not None
+        preds = clf.predict(X)
+        assert len(preds) == 30
+
+    def test_class_weights_computation(self):
+        """Verify class weights are computed correctly."""
+        from src.baseline.comparison import compute_class_weights
+        y = np.array([0] * 80 + [1] * 15 + [2] * 5)
+        weights = compute_class_weights(y)
+        assert len(weights) == 3
+        assert weights[2] > weights[0]  # Minority class gets higher weight
+
+    def test_load_split_data(self):
+        """Verify split data loading works."""
+        from src.baseline.comparison import load_split_data
+        # This will use full dataset if split files don't exist
+        X, y = load_split_data("train")
+        assert X.shape[0] > 0
+        assert y.shape[0] > 0

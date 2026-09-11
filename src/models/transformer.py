@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from typing import Optional
 from sklearn.metrics import classification_report, accuracy_score
 
 try:
@@ -167,7 +168,8 @@ def train_transformer(X_train: np.ndarray, y_train: np.ndarray,
                        epochs: int = 20,
                        batch_size: int = 512,
                        learning_rate: float = 0.0005,
-                       model_dir: str = MODEL_DIR) -> dict:
+                       model_dir: str = MODEL_DIR,
+                       class_weights: Optional[torch.Tensor] = None) -> dict:
     """
     Train a Transformer model on attack sequences.
 
@@ -207,7 +209,18 @@ def train_transformer(X_train: np.ndarray, y_train: np.ndarray,
                                n_heads=n_heads, n_layers=n_layers)
     model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    # Compute class weights to handle imbalance
+    if class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    else:
+        class_counts = np.bincount(y_train.flatten().astype(int))
+        total = class_counts.sum()
+        n_classes = len(class_counts)
+        weight = total / (n_classes * class_counts)
+        weight = np.minimum(weight, weight.max() * 5.0)
+        weight_tensor = torch.FloatTensor(weight / weight.mean()).to(device)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,
                                    weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -345,21 +358,56 @@ if __name__ == "__main__":
     X = np.load("data/sequences/X.npy").astype(np.float32)
     y = np.load("data/sequences/y.npy").astype(np.int64)
 
-    print(f"Loaded {X.shape[0]} sequences, shape: {X.shape}")
+    # Load campaign-level splits if available
+    import json
+    splits_path = "data/sequences/metadata.json"
+    if os.path.exists(splits_path):
+        with open(splits_path) as f:
+            meta = json.load(f)
+        splits = meta.get("campaign_splits", {})
+        print(f"[transformer] Campaign splits found: {splits}")
 
-    # Subsample to 30K for fast training
-    n = len(y)
-    sample_size = min(30000, n)
-    indices = np.random.RandomState(42).choice(n, sample_size, replace=False)
-    X = X[indices]
-    y = y[indices]
+        try:
+            X_train = np.load("data/sequences/X_train.npy").astype(np.float32)
+            y_train = np.load("data/sequences/y_train.npy").astype(np.int64)
+            X_val = np.load("data/sequences/X_val.npy").astype(np.float32)
+            y_val = np.load("data/sequences/y_val.npy").astype(np.int64)
+            X_test = np.load("data/sequences/X_test.npy").astype(np.float32) if os.path.exists("data/sequences/X_test.npy") else X_val
+            y_test = np.load("data/sequences/y_test.npy").astype(np.int64) if os.path.exists("data/sequences/y_test.npy") else y_val
+            print(f"[transformer] Loaded campaign splits: "
+                  f"train={X_train.shape[0]}, "
+                  f"val={X_val.shape[0]}, "
+                  f"test={X_test.shape[0]}")
+        except FileNotFoundError:
+            print("[transformer] Split files not found, using random split")
+            n = len(y)
+            indices = np.random.RandomState(42).choice(n, int(n*0.7), replace=False)
+            mask = np.zeros(n, dtype=bool)
+            mask[indices] = True
+            X_train, X_val = X[mask], X[~mask]
+            y_train, y_val = y[mask], y[~mask]
+            X_test, y_test = X_val, y_val
+    else:
+        print("[transformer] No metadata.json found, using random split")
+        n = len(y)
+        indices = np.random.RandomState(42).choice(n, int(n*0.7), replace=False)
+        mask = np.zeros(n, dtype=bool)
+        mask[indices] = True
+        X_train, X_val = X[mask], X[~mask]
+        y_train, y_val = y[mask], y[~mask]
+        X_test, y_test = X_val, y_val
 
-    # Split 80/20 train/val
-    split = int(len(y) * 0.8)
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
+    print(f"[transformer] Train: {X_train.shape[0]}, "
+          f"Val: {X_val.shape[0]}, "
+          f"Test: {X_test.shape[0]}")
 
-    print(f"Train: {X_train.shape[0]}, Val: {X_val.shape[0]}")
+    # Compute class weights from training data
+    class_counts = np.bincount(y_train.flatten().astype(int))
+    total = class_counts.sum()
+    n_classes = len(class_counts)
+    weight = total / (n_classes * class_counts)
+    weight = np.minimum(weight, weight.max() * 5.0)
+    weight_tensor = torch.FloatTensor(weight / weight.mean())
 
     metadata = train_transformer(X_train, y_train, X_val, y_val,
                                    n_features=X.shape[2],
@@ -367,6 +415,25 @@ if __name__ == "__main__":
                                    n_heads=4,
                                    n_layers=4,
                                    epochs=20,
-                                   batch_size=512)
+                                   batch_size=512,
+                                   class_weights=weight_tensor)
     print(f"\nTransformer training complete. Val accuracy: "
           f"{metadata['val_accuracy']:.4f}")
+
+    # Evaluate on test set (campaign-held-out)
+    print(f"\n[transformer] Evaluating on test set...")
+    model = AttackTransformer(n_features=X.shape[2], d_model=128,
+                               n_heads=4, n_layers=4)
+    model.load_state_dict(torch.load("models/transformer_best.pth", weights_only=False))
+    model.eval()
+    test_dataset = AttackSequenceDataset(X_test, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch_X, batch_y in test_loader:
+            outputs = model(batch_X)
+            _, predicted = torch.max(outputs, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch_y.cpu().numpy())
+    test_acc = accuracy_score(all_labels, all_preds)
+    print(f"[transformer] Test accuracy (campaign-held-out): {test_acc:.4f}")

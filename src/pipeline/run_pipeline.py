@@ -26,8 +26,8 @@ from src.pipeline.labeller import apply_stage_labels, apply_mitre_labels, \
     get_stage_distribution, print_label_mapping_table
 from src.pipeline.features import select_features, handle_infinities, \
     handle_nulls, normalise
-from src.pipeline.sequencer import reconstruct_campaigns, create_windows, \
-    save_sequences, print_campaign_stats
+from src.pipeline.sequencer import reconstruct_campaigns, create_sliding_windows, \
+    create_campaign_splits, save_sequences, print_campaign_stats
 
 
 def run_pipeline(data_dir="data/raw/cicids2017",
@@ -83,10 +83,16 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     campaigns = reconstruct_campaigns(df_normalised, subsample=max_rows, n_campaigns=n_campaigns)
     campaign_stats = print_campaign_stats(campaigns)
 
-    # Step 5: Create sliding windows
-    print("\n[Phase 5/5] Creating sliding-window sequences...")
-    windows = create_windows(campaigns, window_size=20)
-    metadata = save_sequences(windows, output_dir)
+    # Step 5: Create campaign splits
+    print("\n[Phase 5a/5] Splitting campaigns into train/val/test...")
+    campaign_splits = create_campaign_splits(campaigns, train_ratio=0.7, val_ratio=0.15)
+
+    # Step 6: Create sliding windows (temporally-safe)
+    print("\n[Phase 5b/5] Creating sliding-window sequences...")
+    windows = create_sliding_windows(campaigns, window_size=20, forecast_horizon=1)
+    metadata = save_sequences(windows, output_dir,
+                               campaign_splits=campaign_splits,
+                               campaigns=campaigns)
 
     # Summary
     print("\n" + "=" * 80)
@@ -97,6 +103,9 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     print(f"Average campaign length: {campaign_stats['avg_campaign_length']} flows")
     print(f"Sequence shape: {metadata['feature_shape']}")
     print(f"Stage-to-index mapping: {metadata['stage_to_idx']}")
+    print(f"Campaign splits: train={len(campaign_splits['train'])}, "
+          f"val={len(campaign_splits['val'])}, "
+          f"test={len(campaign_splits['test'])}")
     print(f"Sequences saved to: {output_dir}")
     print("=" * 80)
 
