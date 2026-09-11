@@ -43,8 +43,14 @@ STAGE_ORDER = ["Benign", "Recon", "CredAccess", "Exploit", "LateralMove", "C2", 
 # Sliding window length (number of flows to look at for prediction)
 WINDOW_SIZE = 20
 
+# Forecast horizon: predict H steps ahead from end of window
+FORECAST_HORIZON = 1
+
 # Stage to index mapping
 STAGE_TO_IDX = {stage: idx for idx, stage in enumerate(STAGE_ORDER)}
+
+# Forecast lead time: number of flow intervals between window end and target
+FORECAST_LEAD_TIME = FORECAST_HORIZON  # = 1 flow ahead for H=1
 
 # Feature columns: 20 most informative CIC-IDS features
 FEATURE_COLS = [

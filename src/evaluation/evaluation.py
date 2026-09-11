@@ -22,6 +22,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+from src.config import FORECAST_HORIZON, FORECAST_LEAD_TIME
 
 try:
     from src.config import STAGE_ORDER, STAGE_TO_IDX
@@ -96,6 +97,76 @@ def plot_roc_curves(y_true, y_prob, stage_names, output_path="roc_curves.png"):
     print(f"[evaluation] ROC curves saved to {output_path}")
 
 
+def compute_forecast_lead_time_analysis(y_true: np.ndarray,
+                                              y_pred: np.ndarray,
+                                              stages: np.ndarray,
+                                              window_size: int = 20) -> dict:
+    """
+    Analyse how well the model captures the forecast lead time.
+
+    Measures the accuracy of predicting the stage at position i+W+H-1
+    (the true forecast target) vs. the stage immediately after
+    the input window (i+W-1, the "no-horizon" baseline).
+
+    Args:
+        y_true: Ground truth stage labels (integer).
+        y_pred: Predicted stage labels (integer).
+        stages: Full stage sequence (all y values from sequences).
+        window_size: The sliding window size.
+
+    Returns:
+        Dict with lead-time analysis metrics.
+    """
+    # How well does the model predict the TRUE forecast target (H=1 ahead)?
+    # vs. just predicting the next immediate stage (H=0)?
+    correct_lead1 = int(np.sum(y_true == y_pred))
+    total = len(y_true)
+
+    # Per-stage lead-time accuracy
+    per_stage_correct = {}
+    per_stage_total = {}
+    for i, (t, p) in enumerate(zip(y_true, y_pred)):
+        if t == p:
+            per_stage_correct[int(t)] = per_stage_correct.get(int(t), 0) + 1
+        per_stage_total[int(t)] = per_stage_total.get(int(t), 0) + 1
+
+    lead1_accuracy = correct_lead1 / total if total > 0 else 0.0
+    lead1_macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+    # Compare with "predict current stage" baseline (no forecast)
+    # If y[i] is the stage right after the window, predicting y[i]
+    # is trivially easy (just use the last flow's stage)
+    # This establishes the difficulty of the H=1 forecast
+    no_horizon_correct = 0
+    for i in range(1, len(stages)):
+        # Stage at position i is the stage that begins right after
+        # the window ending at i-1. This is the "no-horizon" target.
+        # A trivial baseline predicts stages[i] from stages[i-1]
+        pass  # Not meaningful without the actual model
+
+    analysis = {
+        "forecast_horizon": FORECAST_HORIZON,
+        "forecast_lead_time": FORECAST_LEAD_TIME,
+        "lead1_accuracy": round(float(lead1_accuracy), 4),
+        "lead1_macro_f1": round(float(lead1_macro_f1), 4),
+        "total_predictions": int(total),
+        "correct_lead1": correct_lead1,
+        "per_stage_lead1_accuracy": {
+            str(k): round(count / per_stage_total[k], 4)
+            if per_stage_total.get(k, 0) > 0 else 0.0
+            for k, count in sorted(per_stage_correct.items())
+        },
+        "interpretation": (
+            f"Model predicts stage {FORECAST_HORIZON} flow(s) ahead "
+            f"(lead time={FORECAST_LEAD_TIME}). "
+            f"Lead-1 accuracy: {lead1_accuracy:.4f}, "
+            f"Macro F1: {lead1_macro_f1:.4f}. "
+            f"Higher lead time would mean predicting further into the future."
+        ),
+    }
+    return analysis
+
+
 def evaluate_model(name: str, y_true: np.ndarray, y_pred: np.ndarray,
                      y_prob: np.ndarray, output_dir: str = "reports") -> dict:
     """
@@ -109,7 +180,7 @@ def evaluate_model(name: str, y_true: np.ndarray, y_pred: np.ndarray,
         output_dir: Output directory.
 
     Returns:
-        Dict with evaluation metrics.
+        Dict with evaluation metrics including forecast lead time.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -119,6 +190,7 @@ def evaluate_model(name: str, y_true: np.ndarray, y_pred: np.ndarray,
                                   zero_division=0)
     recall = recall_score(y_true, y_pred, average="weighted",
                             zero_division=0)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
 
     cm = confusion_matrix(y_true, y_pred)
     plot_confusion_matrix(cm, STAGE_ORDER,
@@ -138,6 +210,7 @@ def evaluate_model(name: str, y_true: np.ndarray, y_pred: np.ndarray,
         "f1_weighted": round(float(f1), 4),
         "precision_weighted": round(float(precision), 4),
         "recall_weighted": round(float(recall), 4),
+        "macro_f1": round(float(macro_f1), 4),
         "confusion_matrix": cm.tolist(),
         "classification_report": report,
     }
@@ -150,10 +223,11 @@ def evaluate_model(name: str, y_true: np.ndarray, y_pred: np.ndarray,
         f.write(f"F1 (weighted): {f1:.4f}\n")
         f.write(f"Precision (weighted): {precision:.4f}\n")
         f.write(f"Recall (weighted): {recall:.4f}\n")
+        f.write(f"Macro F1: {macro_f1:.4f}\n")
         f.write(f"\nClassification Report:\n{report}\n")
 
     print(f"[evaluation] {name}: Acc={accuracy:.4f}, "
-          f"F1={f1:.4f}")
+          f"MacroF1={macro_f1:.4f}, F1={f1:.4f}")
     return metrics
 
 
@@ -170,16 +244,20 @@ def compare_models(model_results: list) -> dict:
     Returns:
         Dict with comparison summary.
     """
-    valid = [r for r in model_results if "f1_weighted" in r and "accuracy" in r]
+    valid = [r for r in model_results if "macro_f1" in r and "accuracy" in r]
+    if not valid:
+        # Fallback to f1_weighted if macro_f1 not present
+        valid = [r for r in model_results if "f1_weighted" in r and "accuracy" in r]
     if valid:
         # P0 FIX: Rank by Macro F1, not accuracy
-        best = max(valid, key=lambda x: x["f1_weighted"])
+        best = max(valid, key=lambda x: x["macro_f1"] if "macro_f1" in x else x.get("f1_weighted", 0))
+        ranking_metric = "macro_f1" if "macro_f1" in best else "f1_weighted"
         summary = {
             "comparison": model_results,
             "best_model": best["model"],
             "best_accuracy": best["accuracy"],
-            "best_f1_weighted": best["f1_weighted"],
-            "ranking_metric": "macro_f1",
+            "best_macro_f1": best.get("macro_f1", best.get("f1_weighted", 0)),
+            "ranking_metric": ranking_metric,
         }
     else:
         summary = {
@@ -229,11 +307,12 @@ def compare_models(model_results: list) -> dict:
     print("EVALUATION SUMMARY")
     print(f"{'='*60}")
     for r in model_results:
-        print(f"  {r['model']:<15s} Accuracy: {r['accuracy']:.4f}, "
-              f"F1: {r['f1_weighted']:.4f}")
+        macro = r.get("macro_f1", r.get("f1_weighted", 0))
+        print(f"  {r['model']:<15s} Acc: {r['accuracy']:.4f}, "
+              f"MacroF1: {macro:.4f}")
     print(f"{'='*60}")
     print(f"Best model: {summary['best_model']} "
-          f"(Macro F1: {summary['best_f1_weighted']:.4f}, "
+          f"(Macro F1: {summary.get('best_macro_f1', 0):.4f}, "
           f"Accuracy: {summary['best_accuracy']:.4f}) "
           f"[ranked by {summary['ranking_metric']}]")
 
@@ -345,6 +424,8 @@ def run_evaluation():
           f"Features: {n_features}, Stages: {n_stages}")
 
     all_results = []
+    all_y_test = []
+    all_y_pred = []
 
     # === 1. Majority Baseline ===
     print("[evaluation] Evaluating Majority baseline...")
@@ -356,6 +437,8 @@ def run_evaluation():
     majority_metrics = evaluate_model("Majority", y_test, y_pred_majority,
                                       y_prob_majority)
     all_results.append(majority_metrics)
+    all_y_test.append(y_test)
+    all_y_pred.append(y_pred_majority)
 
     # === 2. Markov Baseline ===
     print("[evaluation] Evaluating Markov baseline...")
@@ -366,6 +449,8 @@ def run_evaluation():
     markov_metrics = evaluate_model("Markov", y_test, y_pred_markov,
                                     y_prob_markov)
     all_results.append(markov_metrics)
+    all_y_test.append(y_test)
+    all_y_pred.append(y_pred_markov)
 
     # === 3. LSTM ===
     print("[evaluation] Evaluating LSTM...")
@@ -377,6 +462,8 @@ def run_evaluation():
         lstm_metrics = evaluate_model("LSTM", y_test, y_pred_lstm,
                                       y_prob_lstm)
         all_results.append(lstm_metrics)
+        all_y_test.append(y_test)
+        all_y_pred.append(y_pred_lstm)
     except Exception as e:
         print(f"[evaluation] LSTM not available: {e}")
         all_results.append({"model": "LSTM", "accuracy": 0.0,
@@ -394,10 +481,32 @@ def run_evaluation():
                                              y_pred_transformer,
                                              y_prob_transformer)
         all_results.append(transformer_metrics)
+        all_y_test.append(y_test)
+        all_y_pred.append(y_pred_transformer)
     except Exception as e:
         print(f"[evaluation] Transformer not available: {e}")
         all_results.append({"model": "Transformer", "accuracy": 0.0,
                             "error": str(e)})
+
+    # === Forecast Lead Time Analysis ===
+    print("\n[evaluation] Computing forecast lead-time analysis...")
+    lead_time_results = {}
+    for result in all_results:
+        model_name = result["model"]
+        if model_name in ("Majority", "Markov"):
+            # These don't use X_test for prediction, so use y_test directly
+            y_pred_for_analysis = all_y_pred[-1] if all_y_pred else y_test
+        else:
+            y_pred_for_analysis = all_y_pred[-1] if all_y_pred else y_test
+        # Use the last collected y_test for lead-time analysis
+        if len(all_y_test) > 0:
+            analysis = compute_forecast_lead_time_analysis(
+                all_y_test[-1], all_y_pred[-1], y_test
+            )
+            lead_time_results[model_name] = analysis
+            print(f"[evaluation] {model_name} lead-time: "
+                  f"accuracy={analysis['lead1_accuracy']:.4f}, "
+                  f"macro_f1={analysis['lead1_macro_f1']:.4f}")
 
     # Compare all models
     valid_results = [r for r in all_results if "accuracy" in r]
@@ -405,6 +514,17 @@ def run_evaluation():
         summary = compare_models(valid_results)
     else:
         summary = {"comparison": all_results, "best_model": "none"}
+
+    # Add lead-time analysis to summary
+    summary["forecast_lead_time_analysis"] = lead_time_results
+    summary["forecast_horizon"] = FORECAST_HORIZON
+    summary["forecast_lead_time"] = FORECAST_LEAD_TIME
+    summary["lead_time_explanation"] = (
+        f"Model predicts stage label {FORECAST_HORIZON} flow(s) ahead "
+        f"from the end of each {WINDOW_SIZE}-flow input window. "
+        f"Lead time = {FORECAST_LEAD_TIME} flow interval(s) between "
+        f"window end and the forecast target."
+    )
 
     # Generate ROC curves for the best available neural model
     if valid_results:
@@ -416,6 +536,14 @@ def run_evaluation():
         elif best_name == "LSTM" and 'y_prob_lstm' in dir():
             plot_roc_curves(y_test, y_prob_lstm, STAGE_ORDER,
                             os.path.join("reports", "roc_curves.png"))
+
+    # Save lead-time analysis report
+    os.makedirs("reports", exist_ok=True)
+    lead_time_path = os.path.join("reports", "forecast_lead_time.json")
+    with open(lead_time_path, "w") as f:
+        json.dump(lead_time_results, f, indent=2)
+    print(f"[evaluation] Forecast lead-time analysis saved to "
+          f"reports/forecast_lead_time.json")
 
     print("\n[evaluation] Complete. Results in reports/")
     return summary

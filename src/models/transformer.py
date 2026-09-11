@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
 from sklearn.metrics import classification_report, accuracy_score, f1_score
+from src.config import FORECAST_HORIZON, FORECAST_LEAD_TIME
 
 try:
     from src.config import STAGE_ORDER, STAGE_TO_IDX, MODEL_DIR
@@ -334,6 +335,12 @@ def train_transformer(X_train: np.ndarray, y_train: np.ndarray,
         "epochs": epochs,
         "history": history,
         "model_path": os.path.join(model_dir, "transformer_best.pth"),
+        "forecast_horizon": FORECAST_HORIZON,
+        "forecast_lead_time": FORECAST_LEAD_TIME,
+        "forecast_description": (
+            f"Predicts stage {FORECAST_HORIZON} flow(s) ahead "
+            f"from window end (lead time = {FORECAST_LEAD_TIME})"
+        ),
     }
     metadata_path = os.path.join(model_dir, "transformer_metadata.json")
     with open(metadata_path, "w") as f:

@@ -32,6 +32,7 @@ STAGE_TO_IDX = {stage: idx for idx, stage in enumerate(
      "LateralMove", "C2", "Impact"])}
 
 FORECAST_HORIZON = 1  # Predict t+H from window ending at t
+FORECAST_LEAD_TIME = 1  # Number of flow intervals between window end and target
 
 
 def reconstruct_campaigns(df: pd.DataFrame,
@@ -254,11 +255,17 @@ def save_sequences(windows: List[Tuple[np.ndarray, int]],
         "num_sequences": len(windows),
         "window_size": WINDOW_SIZE,
         "forecast_horizon": FORECAST_HORIZON,
+        "forecast_lead_time": FORECAST_LEAD_TIME,
         "feature_shape": list(X.shape[1:]),
         "stage_to_idx": STAGE_TO_IDX,
         "idx_to_stage": {v: k for k, v in STAGE_TO_IDX.items()},
         "description": "Strictly-causal sliding-window sequences for attack forecasting",
         "campaign_splits": campaign_splits if campaign_splits else {},
+        "forecast_target_explanation": (
+            "X[i:i+W] predicts stage at position i+W+FORECAST_HORIZON-1. "
+            "With FORECAST_HORIZON=1, the model predicts the stage that "
+            "begins immediately after the input window ends."
+        ),
     }
 
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:

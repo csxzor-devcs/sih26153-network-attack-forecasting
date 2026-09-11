@@ -116,7 +116,7 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     print(f"[pipeline] Fitting RobustScaler on {len(train_flows)} train flows...")
     scaler = RobustScaler()
     scaler.fit(train_feature_matrix)
-    print(f"[pipeline] Scaler fitted. Location shape: {scaler.location_.shape}")
+    print(f"[pipeline] Scaler fitted. Center shape: {scaler.center_.shape}")
 
     # Step 7: Normalise ALL campaigns using train-fitted scaler
     print("\n[Phase 5c/5] Normalising campaigns with train-fitted scaler...")
@@ -159,6 +159,8 @@ def run_pipeline(data_dir="data/raw/cicids2017",
           f"val={len(campaign_splits['val'])}, "
           f"test={len(campaign_splits['test'])}")
     print(f"Scaler fitted on TRAIN ONLY (no leakage)")
+    print(f"Forecast lead time: {metadata['forecast_lead_time']} flow(s) "
+          f"(predict {metadata['forecast_horizon']} step(s) ahead)")
     print(f"Sequences saved to: {output_dir}")
     print("=" * 80)
 
