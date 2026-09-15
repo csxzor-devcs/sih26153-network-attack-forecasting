@@ -27,17 +27,17 @@ from src.pipeline.labeller import apply_stage_labels, apply_mitre_labels, \
 from src.pipeline.features import select_features, handle_infinities, \
     handle_nulls, normalise, RobustScaler
 from src.pipeline.sequencer import reconstruct_campaigns, create_sliding_windows, \
-    create_campaign_splits, save_sequences, print_campaign_stats
+    create_campaign_splits, save_sequences, print_campaign_stats, _count_windows
 
 
 def run_pipeline(data_dir="data/raw/cicids2017",
                  output_dir="data/sequences",
-                 max_rows=100000,
                  n_campaigns=100,
                  use_unsw=False,
                  unswnb15_dir="data/raw/unswnb15"):
     """
     Execute the complete data pipeline from raw CSVs to saved sequences.
+    Uses the FULL dataset (no subsampling).
 
     P0 FIX: Scaler is fitted on training data only (no preprocessing leakage).
     Full pipeline flow:
@@ -51,7 +51,7 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     Args:
         data_dir: Path to CIC-IDS2017 CSV files.
         output_dir: Path to save processed sequences.
-        max_rows: Maximum rows to load to prevent OOM.
+        n_campaigns: Number of campaigns to create.
         use_unsw: Whether to also load UNSW-NB15.
         unswnb15_dir: Path to UNSW-NB15 CSV files.
     """
@@ -59,9 +59,9 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     print("SIH26153 - Data Pipeline Starting")
     print("=" * 80)
 
-    # Step 1: Load CIC-IDS2017 (with row limit to prevent OOM)
-    print("\n[Phase 1/5] Loading CIC-IDS2017...")
-    df = load_cicids2017(data_dir, max_rows=max_rows)
+    # Step 1: Load CIC-IDS2017 (FULL dataset — no subsampling)
+    print("\n[Phase 1/5] Loading CIC-IDS2017 (full dataset)...")
+    df = load_cicids2017(data_dir)
 
     # Step 2: Apply stage labels
     print("\n[Phase 2/5] Applying attack stage labels...")
@@ -88,8 +88,9 @@ def run_pipeline(data_dir="data/raw/cicids2017",
     # Step 4: Reconstruct campaigns BEFORE fitting scaler
     # P0 FIX: Campaigns are created from raw (non-scaled) features
     # so the scaler can be fitted on train data only
-    print("\n[Phase 4/5] Reconstructing attack campaigns...")
-    campaigns = reconstruct_campaigns(df_features, subsample=max_rows,
+    # No subsampling — full dataset for training
+    print("\n[Phase 4/5] Reconstructing attack campaigns (full dataset)...")
+    campaigns = reconstruct_campaigns(df_features, subsample=None,
                                        n_campaigns=n_campaigns)
     campaign_stats = print_campaign_stats(campaigns)
 
@@ -140,11 +141,17 @@ def run_pipeline(data_dir="data/raw/cicids2017",
 
     # Step 8: Create sliding windows (temporally-safe)
     print("\n[Phase 6/5] Creating sliding-window sequences...")
+
+    # Count total windows for pre-allocation (without materializing)
+    total_windows = _count_windows(campaigns, window_size=20, forecast_horizon=1)
+    print(f"[pipeline] Total windows to create: {total_windows}")
+
+    # Stream windows directly to disk using memmap (memory-efficient)
     windows = create_sliding_windows(campaigns, window_size=20,
                                       forecast_horizon=1)
     metadata = save_sequences(windows, output_dir,
-                               campaign_splits=campaign_splits,
-                               campaigns=campaigns)
+                       campaign_splits=campaign_splits,
+                       campaigns=campaigns)
 
     # Summary
     print("\n" + "=" * 80)

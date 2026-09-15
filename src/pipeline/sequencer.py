@@ -36,18 +36,21 @@ FORECAST_LEAD_TIME = 1  # Number of flow intervals between window end and target
 
 
 def reconstruct_campaigns(df: pd.DataFrame,
-                           subsample: int = 500000,
+                           subsample: Optional[int] = None,
                            n_campaigns: int = 100,
                            min_campaign_length: int = WINDOW_SIZE + 1) -> Dict[str, list]:
     """
     Reconstruct attack campaigns from temporally-ordered network flows.
+
+    When subsample is None, uses the full dataset (no subsampling).
 
     FIXED: Preserves all FEATURE_COLS in each flow dict so that
     _flows_to_matrix() receives actual feature values, not zeros.
 
     Args:
         df: DataFrame with 'Timestamp', 'stage', 'Label', and FEATURE_COLS.
-        subsample: If df has more rows than this, take a stratified sample.
+        subsample: If not None and df has more rows than this, subsample.
+                   None means use all rows (full dataset).
         n_campaigns: Number of campaigns to create.
         min_campaign_length: Minimum flows per campaign.
 
@@ -57,13 +60,11 @@ def reconstruct_campaigns(df: pd.DataFrame,
         AND all FEATURE_COLS values.
     """
     # CRITICAL: Sort by Timestamp to ensure temporal ordering
-    # P2 FIX: Preserve temporal continuity — subsample via contiguous
-    # time windows, NOT stratified random sampling which destroys
-    # the sequential nature of attack campaigns
     df_sorted = df.sort_values("Timestamp").reset_index(drop=True)
     n = len(df_sorted)
 
-    if n > subsample:
+    # Only subsample if explicitly requested and needed
+    if subsample is not None and n > subsample:
         print(f"[sequencer] Dataset has {n} rows -- subsampling to {subsample}")
         # Use contiguous time segments to preserve temporal structure
         # Pick evenly-spaced time windows across the dataset
@@ -141,7 +142,7 @@ def reconstruct_campaigns(df: pd.DataFrame,
 
 def create_sliding_windows(campaigns: Dict[str, list],
                            window_size: int = WINDOW_SIZE,
-                           forecast_horizon: int = FORECAST_HORIZON) -> List[Tuple[np.ndarray, int]]:
+                           forecast_horizon: int = FORECAST_HORIZON):
     """
     Create strictly-causal sliding-window sequences.
 
@@ -157,11 +158,11 @@ def create_sliding_windows(campaigns: Dict[str, list],
         window_size: Number of flows in each input window.
         forecast_horizon: How many steps ahead to predict.
 
-    Returns:
-        List of (X, y) tuples where X shape=(window_size, n_features),
+    Yields:
+        (X, y) tuples where X shape=(window_size, n_features),
         y is integer stage label at position i+window_size+forecast_horizon-1.
     """
-    windows = []
+    count = 0
     n_skipped = 0
 
     for src_ip, flows in campaigns.items():
@@ -181,14 +182,15 @@ def create_sliding_windows(campaigns: Dict[str, list],
 
             try:
                 X = _flows_to_matrix(window_flows)
-                windows.append((X, y))
+                yield (X, y)
+                count += 1
             except (KeyError, ValueError):
                 n_skipped += 1
                 continue
 
-    print(f"[sequencer] Created {len(windows)} sequences "
-          f"(window_size={window_size}, forecast_horizon={forecast_horizon})")
-    return windows
+    print(f"[sequencer] Created {count} sequences "
+          f"(window_size={window_size}, forecast_horizon={forecast_horizon}, "
+          f"skipped={n_skipped})")
 
 
 def create_campaign_splits(campaigns: Dict[str, list],
@@ -231,32 +233,158 @@ def _flows_to_matrix(flows: list) -> np.ndarray:
     return feature_matrix
 
 
-def save_sequences(windows: List[Tuple[np.ndarray, int]],
+def _count_windows(campaigns: Dict[str, list],
+                   window_size: int = WINDOW_SIZE,
+                   forecast_horizon: int = FORECAST_HORIZON) -> int:
+    """Count total windows without materializing them (for pre-allocation)."""
+    count = 0
+    for flows in campaigns.values():
+        if len(flows) < window_size + forecast_horizon:
+            continue
+        stages = [f["stage"] for f in flows]
+        for i in range(len(flows) - window_size - forecast_horizon + 1):
+            target_idx = i + window_size + forecast_horizon - 1
+            next_stage = stages[target_idx]
+            if STAGE_TO_IDX.get(next_stage, -1) != -1:
+                count += 1
+    return count
+
+
+def _save_split_streaming(split_campaigns: Dict[str, list],
+                          output_dir: str,
+                          split_name: str,
+                          window_size: int = WINDOW_SIZE,
+                          forecast_horizon: int = FORECAST_HORIZON) -> int:
+    """Save a campaign split using streaming memmap to avoid holding all in memory.
+
+    Returns the number of sequences saved.
+    """
+    n_seqs = _count_windows(split_campaigns, window_size, forecast_horizon)
+    if n_seqs == 0:
+        return 0
+
+    n_features = len(FEATURE_COLS)
+    X_path = os.path.join(output_dir, f"X_{split_name}.npy")
+    y_path = os.path.join(output_dir, f"y_{split_name}.npy")
+
+    # Use raw temp files for memmap streaming, then convert to proper .npy
+    X_tmp = X_path + ".tmp"
+    y_tmp = y_path + ".tmp"
+
+    # Stream windows into raw memmap (no .npy header)
+    X_mm = np.memmap(X_tmp, dtype=np.float32, mode='w+',
+                      shape=(n_seqs, window_size, n_features))
+    y_mm = np.memmap(y_tmp, dtype=np.int64, mode='w+',
+                      shape=(n_seqs,))
+
+    idx = 0
+    for X, y in create_sliding_windows(split_campaigns, window_size, forecast_horizon):
+        X_mm[idx] = X
+        y_mm[idx] = y
+        idx += 1
+
+    X_mm.flush()
+    y_mm.flush()
+    del X_mm, y_mm
+
+    # Convert to proper .npy by reading raw data and saving with header
+    # Use copy=False to avoid duplicating the large array in memory
+    X_raw = np.memmap(X_tmp, dtype=np.float32, mode='r',
+                       shape=(n_seqs, window_size, n_features))
+    y_raw = np.memmap(y_tmp, dtype=np.int64, mode='r', shape=(n_seqs,))
+
+    # np.save reads from memmap incrementally, writes proper .npy
+    np.save(X_path, X_raw[:idx])
+    np.save(y_path, y_raw[:idx])
+
+    del X_raw, y_raw
+    os.remove(X_tmp)
+    os.remove(y_tmp)
+
+    print(f"[sequencer] Saved {idx} {split_name} sequences "
+          f"with H={forecast_horizon} forecast target")
+    return idx
+
+
+def save_sequences(windows,
                    output_dir: str = SEQUENCE_DIR,
                    campaign_splits: Optional[Dict[str, List[str]]] = None,
                    campaigns: Optional[Dict[str, list]] = None) -> dict:
     """Save sequences as X.npy, y.npy, metadata.json, and campaign split files.
+
+    Accepts a generator (from create_sliding_windows) for memory-efficient
+    streaming writes using pre-allocated numpy memmap.
 
     P0 FIX: Split datasets use create_sliding_windows() to ensure
     forecast targets are consistent (X[i:i+W] → y[i+W+H-1]).
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    X_list = [w[0] for w in windows]
-    y_list = [w[1] for w in windows]
+    n_features = len(FEATURE_COLS)
+    window_size = WINDOW_SIZE
+    forecast_horizon = FORECAST_HORIZON
 
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.int64)
+    # Count total windows for pre-allocation
+    print("[sequencer] Counting total windows for pre-allocation...")
+    total_count = 0
+    # We need to count windows across ALL campaigns (since the generator
+    # iterates over everything). We count per-split by splitting campaigns first.
+    if campaign_splits and campaigns:
+        total_count = sum(
+            _count_windows({cid: campaigns[cid] for cid in cids if cid in campaigns},
+                          window_size, forecast_horizon)
+            for cids in campaign_splits.values()
+        )
+    else:
+        total_count = _count_windows(campaigns or {}, window_size, forecast_horizon)
 
-    np.save(os.path.join(output_dir, "X.npy"), X)
-    np.save(os.path.join(output_dir, "y.npy"), y)
+    print(f"[sequencer] Pre-allocating for {total_count} sequences "
+          f"(shape: ({total_count}, {window_size}, {n_features}))")
+
+    # Pre-allocate memmap arrays (use temp files, convert to .npy after)
+    X_path = os.path.join(output_dir, "X.npy")
+    y_path = os.path.join(output_dir, "y.npy")
+    X_tmp = X_path + ".tmp"
+    y_tmp = y_path + ".tmp"
+
+    X_mm = np.memmap(X_tmp, dtype=np.float32, mode='w+',
+                     shape=(total_count, window_size, n_features))
+    y_mm = np.memmap(y_tmp, dtype=np.int64, mode='w+', shape=(total_count,))
+
+    # Stream windows into memmap
+    idx = 0
+    for X, y in windows:
+        X_mm[idx] = X
+        y_mm[idx] = y
+        idx += 1
+        if idx % 100000 == 0:
+            print(f"[sequencer] Streamed {idx}/{total_count} sequences...")
+
+    X_mm.flush()
+    y_mm.flush()
+    del X_mm, y_mm
+
+    # Convert to proper .npy format
+    X_raw = np.memmap(X_tmp, dtype=np.float32, mode='r',
+                       shape=(total_count, window_size, n_features))
+    y_raw = np.memmap(y_tmp, dtype=np.int64, mode='r', shape=(total_count,))
+    np.save(X_path, X_raw[:idx])
+    np.save(y_path, y_raw[:idx])
+    del X_raw, y_raw
+    os.remove(X_tmp)
+    os.remove(y_tmp)
+
+    # Verify
+    X_shape = (idx, window_size, n_features)
+    print(f"[sequencer] Saved {idx} sequences to {output_dir}")
+    print(f"[sequencer] X.npy shape: {X_shape}, y.npy shape: ({idx},)")
 
     metadata = {
-        "num_sequences": len(windows),
-        "window_size": WINDOW_SIZE,
-        "forecast_horizon": FORECAST_HORIZON,
+        "num_sequences": idx,
+        "window_size": window_size,
+        "forecast_horizon": forecast_horizon,
         "forecast_lead_time": FORECAST_LEAD_TIME,
-        "feature_shape": list(X.shape[1:]),
+        "feature_shape": list(X_shape[1:]),
         "stage_to_idx": STAGE_TO_IDX,
         "idx_to_stage": {v: k for k, v in STAGE_TO_IDX.items()},
         "description": "Strictly-causal sliding-window sequences for attack forecasting",
@@ -271,24 +399,15 @@ def save_sequences(windows: List[Tuple[np.ndarray, int]],
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # Save campaign-level splits using the SAME window generation logic
-    # P0 FIX: Uses create_sliding_windows() to ensure consistent targets
+    # Save campaign-level splits using streaming memmap
     if campaign_splits and campaigns:
         for split_name, campaign_ids in campaign_splits.items():
             split_campaigns = {cid: campaigns[cid] for cid in campaign_ids if cid in campaigns}
-            split_windows = create_sliding_windows(split_campaigns,
-                                                     window_size=WINDOW_SIZE,
-                                                     forecast_horizon=FORECAST_HORIZON)
-            if split_windows:
-                X_split = np.array([w[0] for w in split_windows], dtype=np.float32)
-                y_split = np.array([w[1] for w in split_windows], dtype=np.int64)
-                np.save(os.path.join(output_dir, f"X_{split_name}.npy"), X_split)
-                np.save(os.path.join(output_dir, f"y_{split_name}.npy"), y_split)
-                print(f"[sequencer] Saved {len(split_windows)} {split_name} sequences "
-                      f"with H={FORECAST_HORIZON} forecast target")
+            if split_campaigns:
+                _save_split_streaming(split_campaigns, output_dir, split_name,
+                                      window_size, forecast_horizon)
 
-    print(f"[sequencer] Saved {len(windows)} sequences to {output_dir}")
-    print(f"[sequencer] X.npy shape: {X.shape}, y.npy shape: {y.shape}")
+    print(f"[sequencer] All sequences saved to {output_dir}")
 
     return metadata
 

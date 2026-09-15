@@ -82,14 +82,13 @@ _CIC_DTYPES = {
 }
 
 
-def load_cicids2017(data_dir: str, max_rows: Optional[int] = None) -> pd.DataFrame:
+def load_cicids2017(data_dir: str) -> pd.DataFrame:
     """
     Load all CIC-IDS2017 CSV files from a directory with memory-efficient dtypes.
+    Uses the FULL dataset (no subsampling).
 
     Args:
         data_dir: Path to directory containing CIC-IDS2017 CSV files.
-        max_rows: Maximum total rows to load across all files.
-                  If None, loads all rows.
 
     Returns:
         Concatenated DataFrame with cleaned column names and string values.
@@ -139,11 +138,6 @@ def load_cicids2017(data_dir: str, max_rows: Optional[int] = None) -> pd.DataFra
         for idx, label in enumerate(df["Label"].unique()):
             label_to_ip[str(label).strip()] = f"10.0.{idx // 256}.{idx % 256}"
         df["src_ip"] = df["Label"].map(label_to_ip).fillna("0.0.0.0")
-
-    # Apply row limit if specified
-    if max_rows is not None and len(df) > max_rows:
-        print(f"[loader] Limiting to {max_rows} rows (was {len(df)})")
-        df = df.sample(max_rows, random_state=42).reset_index(drop=True)
 
     print(f"[loader] CIC-IDS2017 loaded: shape={df.shape}")
     print(f"[loader] Label distribution:\n{df['Label'].value_counts()}")

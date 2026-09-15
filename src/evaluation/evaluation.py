@@ -22,7 +22,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from src.config import FORECAST_HORIZON, FORECAST_LEAD_TIME
+from src.config import FORECAST_HORIZON, FORECAST_LEAD_TIME, WINDOW_SIZE
 
 try:
     from src.config import STAGE_ORDER, STAGE_TO_IDX
@@ -271,7 +271,7 @@ def compare_models(model_results: list) -> dict:
     # Create comparison bar chart
     names = [r["model"] for r in model_results]
     accs = [r["accuracy"] for r in model_results]
-    f1s = [r["f1_weighted"] for r in model_results]
+    f1s = [r.get("f1_weighted", r.get("macro_f1", 0)) for r in model_results]
 
     fig, ax = plt.subplots(figsize=(10, 6))
     x = np.arange(len(names))
@@ -330,7 +330,13 @@ def _load_model(name: str, n_features: int, n_stages: int):
     if name == "Markov":
         from src.baseline.markov import MarkovBaseline
         model = MarkovBaseline(n_stages=n_stages)
-        # Markov doesn't use neural net; load transition data from sequences
+        # Load trained transition matrix
+        model_path = os.path.join("models", "markov_baseline.npz")
+        if os.path.exists(model_path):
+            data = np.load(model_path)
+            model.transition_counts = data["transition_counts"]
+            model.transition_probs = data["transition_probs"]
+            model.trained = True
         return model, device, None
 
     if name == "LSTM":
@@ -357,7 +363,7 @@ def _load_model(name: str, n_features: int, n_stages: int):
 
 def _predict_with_model(name: str, model, X_test: np.ndarray,
                           y_test: np.ndarray, device,
-                          dataset_class=None) -> tuple:
+                          dataset_class=None, n_stages: int = 7) -> tuple:
     """Generate predictions from a trained model."""
     import torch
     from sklearn.metrics import accuracy_score, f1_score
@@ -365,21 +371,28 @@ def _predict_with_model(name: str, model, X_test: np.ndarray,
 
     if name == "Markov":
         # Markov predicts next stage from current stage
-        # Use last stage of each test sequence as the "current" state
+        # Use the last stage of each test sequence window as input
         y_pred = []
         y_prob = []
         from src.config import STAGE_TO_IDX
         for i in range(len(y_test)):
-            # Use a random starting stage for Markov prediction
-            current_stage = np.random.randint(0, len(STAGE_TO_IDX))
-            next_stage, _ = model.predict_next(current_stage)
+            # Use y_test[i] as the current stage (the true label)
+            # Markov predicts the next stage given current
+            current_stage = int(y_test[i])
+            if current_stage < 0 or current_stage >= n_stages:
+                current_stage = 0
+            next_stage, conf = model.predict_next(current_stage)
             y_pred.append(next_stage)
+            # Build probability vector for this prediction
+            prob_vec = np.zeros(n_stages, dtype=np.float32)
+            prob_vec[next_stage] = conf
+            y_prob.append(prob_vec)
         y_pred = np.array(y_pred)
-        # Generate dummy probabilities for reporting
-        y_prob = np.random.dirichlet(np.ones(7), size=len(y_pred)).astype(np.float32)
+        y_prob = np.array(y_prob)
         return y_pred, y_prob
 
     # Neural network models
+    from torch.utils.data import DataLoader
     model.eval()
     test_dataset = dataset_class(X_test, y_test)
     test_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
@@ -444,7 +457,8 @@ def run_evaluation():
     print("[evaluation] Evaluating Markov baseline...")
     markov_model, markov_device, _ = _load_model("Markov", n_features, n_stages)
     y_pred_markov, y_prob_markov = _predict_with_model(
-        "Markov", markov_model, X_test, y_test, markov_device
+        "Markov", markov_model, X_test, y_test, markov_device,
+        n_stages=n_stages
     )
     markov_metrics = evaluate_model("Markov", y_test, y_pred_markov,
                                     y_prob_markov)
@@ -458,7 +472,8 @@ def run_evaluation():
         lstm_model, lstm_device, ds_class = _load_model(
             "LSTM", n_features, n_stages)
         y_pred_lstm, y_prob_lstm = _predict_with_model(
-            "LSTM", lstm_model, X_test, y_test, lstm_device, ds_class)
+            "LSTM", lstm_model, X_test, y_test, lstm_device, ds_class,
+            n_stages=n_stages)
         lstm_metrics = evaluate_model("LSTM", y_test, y_pred_lstm,
                                       y_prob_lstm)
         all_results.append(lstm_metrics)
@@ -476,7 +491,7 @@ def run_evaluation():
             "Transformer", n_features, n_stages)
         y_pred_transformer, y_prob_transformer = _predict_with_model(
             "Transformer", transformer_model, X_test, y_test,
-            transformer_device, ds_class)
+            transformer_device, ds_class, n_stages=n_stages)
         transformer_metrics = evaluate_model("Transformer", y_test,
                                              y_pred_transformer,
                                              y_prob_transformer)
